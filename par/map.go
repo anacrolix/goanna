@@ -8,54 +8,101 @@ import (
 	"github.com/anacrolix/goanna/iter"
 )
 
+type MapOutputIter[T any] interface {
+	iter.Iter[T]
+	Close() error
+}
+
 // Runs the map function parallelized over the values in the input iterator. It does batching to
 // reduce scheduler and channel overhead. Inspired by Rust's rayon's par_iter. It does not do
 // dynamic chunk sizing (yet). You must completely consume the output iterator.
 func Map[T, O any, WorkerState any](
 	iter iter.Iter[T],
 	f func(T, *WorkerState) O,
-) iter.Iter[O] {
+) MapOutputIter[O] {
+	return MapOpt(defaultMapOpts, iter, f)
+}
+
+type MapOpts struct {
+	BatchSize int
+}
+
+var defaultMapOpts = MapOpts{
+	BatchSize: 1024,
+}
+
+// Runs the map function parallelized over the values in the input iterator. It does batching to
+// reduce scheduler and channel overhead. Inspired by Rust's rayon's par_iter. It does not do
+// dynamic chunk sizing (yet). You must completely consume the output iterator.
+func MapOpt[T, O any, WorkerState any](
+	opts MapOpts,
+	iter iter.Iter[T],
+	f func(T, *WorkerState) O,
+) MapOutputIter[O] {
 	numWorkers := runtime.NumCPU()
-	batches := make(chan []T)
+	inputBatches := make(chan []T)
 	outputBatches := make(chan []O)
-	var closeOutputsBarrier sync.WaitGroup
+	var workersStopped sync.WaitGroup
+	closed := make(chan struct{})
 	for range g.Range(numWorkers) {
-		closeOutputsBarrier.Add(1)
+		workersStopped.Add(1)
 		go func() {
 			var workerState WorkerState
-			for batch := range batches {
+		processInput:
+			for batch := range inputBatches {
 				outputBatch := make([]O, 0, len(batch))
 				for _, t := range batch {
 					outputBatch = append(outputBatch, f(t, &workerState))
 				}
-				outputBatches <- outputBatch
+				select {
+				case outputBatches <- outputBatch:
+				case <-closed:
+					break processInput
+				}
 			}
-			closeOutputsBarrier.Done()
+			workersStopped.Done()
 		}()
 	}
 	go func() {
 		var batcher batcher[T]
-		batcher.Limit = 1024
+		batcher.Limit = opts.BatchSize
+	batchInput:
 		for iter.Next() {
 			batcher.Submit(iter.Value())
-			if batcher.Full() {
-				batches <- batcher.Drain()
+			if batcher.IsFull() {
+				select {
+				case inputBatches <- batcher.Drain():
+				case <-closed:
+					break batchInput
+				}
 			}
 		}
-		batches <- batcher.Drain()
-		close(batches)
-		closeOutputsBarrier.Wait()
+		if !batcher.IsEmpty() {
+			select {
+			case inputBatches <- batcher.Drain():
+			case <-closed:
+			}
+		}
+		close(inputBatches)
+		workersStopped.Wait()
 		close(outputBatches)
 	}()
 	return &parMapOutputIter[O]{
-		outputBatches: outputBatches,
+		outputBatches:  outputBatches,
+		closed:         closed,
+		workersStopped: &workersStopped,
 	}
 }
 
 type parMapOutputIter[T any] struct {
-	outputBatches chan []T
-	currentBatch  []T
+	outputBatches  chan []T
+	currentBatch   []T
+	closed         chan struct{}
+	closeOnce      sync.Once
+	workersStopped *sync.WaitGroup
 }
+
+var _ MapOutputIter[struct{}] = (*parMapOutputIter[struct{}])(nil)
 
 func (me *parMapOutputIter[T]) Next() bool {
 	if len(me.currentBatch) > 0 {
@@ -73,4 +120,12 @@ func (me *parMapOutputIter[T]) Next() bool {
 
 func (me *parMapOutputIter[T]) Value() T {
 	return me.currentBatch[0]
+}
+
+func (me *parMapOutputIter[T]) Close() error {
+	me.closeOnce.Do(func() {
+		close(me.closed)
+	})
+	me.workersStopped.Wait()
+	return nil
 }

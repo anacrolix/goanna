@@ -4,6 +4,8 @@ import (
 	g "github.com/anacrolix/generics"
 )
 
+type IterFunc[T any] func(func(T) bool) bool
+
 // An iterator over a sequence of values. This avoids using an Option type for easier use as a loop
 // condition. An interesting property of this is that it might be necessary to store the value
 // inside the iterator after checking Next.
@@ -40,4 +42,10 @@ func ToChan[T any](iter Iter[T]) <-chan T {
 		close(ch)
 	}()
 	return ch
+}
+
+func Repeat[T any](v T) Iter[T] {
+	return FromFunc(func() g.Option[T] {
+		return g.Some(v)
+	})
 }

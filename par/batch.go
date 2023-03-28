@@ -5,7 +5,11 @@ type batcher[T any] struct {
 	sl    []T
 }
 
-func (b *batcher[T]) Full() bool {
+func (b *batcher[T]) IsEmpty() bool {
+	return len(b.sl) == 0
+}
+
+func (b *batcher[T]) IsFull() bool {
 	return len(b.sl) >= b.Limit
 }
 
